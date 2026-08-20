@@ -11,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,6 +32,7 @@ func newResponsesStreamTestInfo(model string, estimatePromptTokens int) *relayco
 func runResponsesStreamBody(t *testing.T, info *relaycommon.RelayInfo, body string) (*relaycommon.RelayInfo, int, int, int, string) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
+	service.InitTokenEncoders()
 	oldTimeout := constant.StreamingTimeout
 	if oldTimeout == 0 {
 		constant.StreamingTimeout = 30
