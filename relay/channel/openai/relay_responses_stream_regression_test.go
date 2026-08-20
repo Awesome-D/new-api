@@ -148,3 +148,28 @@ func TestOaiResponsesStreamHandlerUsesTotalOnlyUsageInsteadOfZero(t *testing.T) 
 	assert.Equal(t, 0, completion)
 	assert.Equal(t, 5000, total)
 }
+
+func TestOaiResponsesStreamHandlerIncompleteStillUsesPromptFallback(t *testing.T) {
+	info := newResponsesStreamTestInfo("gpt-5.1", 777)
+	body := "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n"
+
+	info, prompt, completion, total, _ := runResponsesStreamBody(t, info, body)
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	assert.Equal(t, 777, prompt)
+	assert.Equal(t, 0, completion)
+	assert.Equal(t, 777, total)
+}
+
+func TestOaiResponsesStreamHandlerFailedDoesNotInventPromptUsage(t *testing.T) {
+	info := newResponsesStreamTestInfo("gpt-5.1", 999)
+	body := "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n"
+
+	info, prompt, completion, total, _ := runResponsesStreamBody(t, info, body)
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonHandlerStop, info.StreamStatus.EndReason)
+	assert.True(t, info.StreamStatus.HasErrors())
+	assert.Equal(t, 0, prompt)
+	assert.Equal(t, 0, completion)
+	assert.Equal(t, 0, total)
+}
