@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
@@ -26,6 +27,14 @@ const (
 	InitialScannerBufferSize    = 64 << 10  // 64KB (64*1024)
 	DefaultMaxScannerBufferSize = 128 << 20 // 64MB (64*1024*1024) default SSE buffer size
 	DefaultPingInterval         = 10 * time.Second
+	// Responses streams can stay quiet while the model is reasoning. Keep a
+	// protocol-safe SSE comment flowing so 30s-class downstream/proxy idle
+	// timers do not tear down an otherwise healthy Codex request.
+	DefaultResponsesPingInterval = 10 * time.Second
+	// Codex-style clients may close immediately around the final event. Give the
+	// scanner a short bounded window to consume an already in-flight terminal
+	// event before classifying the request as a real client_gone.
+	ResponsesClientDisconnectGrace = 500 * time.Millisecond
 	// streamWriteTimeout bounds a single blocked write to a slow client so the
 	// unconditional wg.Wait() in cleanup can always finish. Without it, a slow
 	// but connected client (full TCP buffer, no server WriteTimeout) could hang
@@ -104,11 +113,19 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		})
 	}
 
+	isResponsesStream := info.RelayMode == relayconstant.RelayModeResponses ||
+		strings.HasPrefix(info.RequestURLPath, "/v1/responses")
 	generalSettings := operation_setting.GetGeneralSetting()
 	pingEnabled := generalSettings.PingIntervalEnabled && !info.DisablePing
 	pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
 	if pingInterval <= 0 {
 		pingInterval = DefaultPingInterval
+	}
+	if isResponsesStream && !info.DisablePing {
+		pingEnabled = true
+		if !generalSettings.PingIntervalEnabled || pingInterval > DefaultResponsesPingInterval {
+			pingInterval = DefaultResponsesPingInterval
+		}
 	}
 
 	if pingEnabled {
@@ -295,8 +312,23 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	case <-stopChan:
 		// EndReason already set by the goroutine that triggered stopChan
 	case <-c.Request.Context().Done():
-		// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
-		// 避免为已放弃的请求继续消费上游 token。
+		// 客户端断开时，大多数协议应立即关闭上游，避免继续消耗 token。
+		// Responses/Codex 的终态与客户端关闭存在已知的亚秒竞态，因此仅在
+		// 已收到上游数据时给一个很短的 drain window，让已在途的 completed
+		// / done / EOF 有机会先落地；超时后仍立即按真实 client_gone 处理。
+		if isResponsesStream && info.ReceivedResponseCount > 0 && !info.StreamStatus.IsNormalEnd() {
+			graceTimer := time.NewTimer(ResponsesClientDisconnectGrace)
+			select {
+			case <-stopChan:
+				if !graceTimer.Stop() {
+					select {
+					case <-graceTimer.C:
+					default:
+					}
+				}
+			case <-graceTimer.C:
+			}
+		}
 		// 若流其实已正常结束（scanner/handler 已收到终态），不要降级为 client_gone。
 		if !info.StreamStatus.IsNormalEnd() {
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
