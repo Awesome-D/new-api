@@ -112,14 +112,28 @@ func PingData(c *gin.Context) error {
 		return errors.New("context or writer is nil")
 	}
 
+	// A heartbeat is best-effort. Once the downstream request has been
+	// cancelled, the main stream loop owns terminal classification (including
+	// the Responses drain window). Treating that cancellation as ping_fail can
+	// race with an already in-flight response.completed and poison an otherwise
+	// successful request's stream status.
 	if requestContextDone(c) {
-		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
+		return nil
 	}
 
 	if _, err := c.Writer.Write([]byte(": PING\n\n")); err != nil {
+		if requestContextDone(c) {
+			return nil
+		}
 		return fmt.Errorf("write ping data failed: %w", err)
 	}
-	return FlushWriter(c)
+	if err := FlushWriter(c); err != nil {
+		if requestContextDone(c) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func ObjectData(c *gin.Context, object interface{}) error {
