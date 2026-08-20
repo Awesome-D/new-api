@@ -17,6 +17,94 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func applyResponsesUsage(dst *dto.Usage, src *dto.Usage) {
+	if dst == nil || src == nil {
+		return
+	}
+
+	// Preserve all upstream metadata first, then normalize Responses-native
+	// input/output fields into the prompt/completion fields used by settlement.
+	*dst = *src
+	if dst.PromptTokens == 0 {
+		dst.PromptTokens = src.InputTokens
+	}
+	if dst.CompletionTokens == 0 {
+		dst.CompletionTokens = src.OutputTokens
+	}
+	if src.InputTokensDetails != nil {
+		dst.PromptTokensDetails = *src.InputTokensDetails
+	}
+}
+
+func finalizeResponsesUsage(info *relaycommon.RelayInfo, usage *dto.Usage, fallbackOutput string) {
+	if usage == nil {
+		return
+	}
+
+	// If the upstream omitted output usage, estimate what is observable. This
+	// includes normal text, reasoning summaries, and function-call argument
+	// deltas collected by the stream handler.
+	if usage.CompletionTokens == 0 && fallbackOutput != "" && info != nil {
+		usage.CompletionTokens = service.CountTextToken(fallbackOutput, info.UpstreamModelName)
+	}
+
+	// Some OpenAI-compatible upstreams only return total_tokens. Reconstruct a
+	// usable prompt/completion split when possible instead of discarding a
+	// non-zero total and settling the request as free.
+	if usage.PromptTokens == 0 && usage.TotalTokens > usage.CompletionTokens {
+		usage.PromptTokens = usage.TotalTokens - usage.CompletionTokens
+	}
+	if usage.CompletionTokens == 0 && usage.TotalTokens > usage.PromptTokens {
+		usage.CompletionTokens = usage.TotalTokens - usage.PromptTokens
+	}
+
+	// Final billing fallback: even a tool-only/reasoning-only Responses turn may
+	// have no visible output text. The locally estimated prompt is still known
+	// and must be charged rather than turning the whole request into $0.
+	if usage.PromptTokens == 0 && info != nil {
+		usage.PromptTokens = info.GetEstimatePromptTokens()
+	}
+
+	if usage.InputTokens == 0 {
+		usage.InputTokens = usage.PromptTokens
+	}
+	if usage.OutputTokens == 0 {
+		usage.OutputTokens = usage.CompletionTokens
+	}
+	if usage.PromptTokens > 0 || usage.CompletionTokens > 0 {
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
+}
+
+func responsesFallbackOutputText(outputs []dto.ResponsesOutput) string {
+	var b strings.Builder
+	for _, output := range outputs {
+		for _, content := range output.Content {
+			if content.Text != "" {
+				b.WriteString(content.Text)
+			}
+		}
+		if output.Type == dto.BuildInCallFunctionCall {
+			if output.Name != "" {
+				b.WriteString(output.Name)
+			}
+			if arguments := output.ArgumentsString(); arguments != "" {
+				b.WriteString(arguments)
+			}
+		}
+	}
+	return b.String()
+}
+
+func responsesStreamTerminalError(streamResponse dto.ResponsesStreamResponse) error {
+	if streamResponse.Response != nil {
+		if oaiErr := streamResponse.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Message != "" {
+			return fmt.Errorf("responses stream %s: %s", streamResponse.Type, oaiErr.Message)
+		}
+	}
+	return fmt.Errorf("responses stream ended with %s", streamResponse.Type)
+}
+
 func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 
@@ -39,15 +127,9 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 
 	// compute usage
 	usage := dto.Usage{}
-	if responsesResponse.Usage != nil {
-		usage.PromptTokens = responsesResponse.Usage.InputTokens
-		usage.CompletionTokens = responsesResponse.Usage.OutputTokens
-		usage.TotalTokens = responsesResponse.Usage.TotalTokens
-		if responsesResponse.Usage.InputTokensDetails != nil {
-			usage.PromptTokensDetails.CachedTokens = responsesResponse.Usage.InputTokensDetails.CachedTokens
-			usage.PromptTokensDetails.CacheWriteTokens = responsesResponse.Usage.InputTokensDetails.CacheWriteTokens
-		}
-	}
+	applyResponsesUsage(&usage, responsesResponse.Usage)
+	finalizeResponsesUsage(info, &usage, responsesFallbackOutputText(responsesResponse.Output))
+
 	// Count actual tool invocations from Output (not tool declarations).
 	for _, output := range responsesResponse.Output {
 		switch output.Type {
@@ -81,7 +163,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	defer service.CloseResponseBodyGracefully(resp)
 
 	var usage = &dto.Usage{}
-	var responseTextBuilder strings.Builder
+	var fallbackOutputBuilder strings.Builder
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
 
@@ -98,21 +180,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		switch streamResponse.Type {
 		case "response.completed", "response.done":
 			if streamResponse.Response != nil {
-				if streamResponse.Response.Usage != nil {
-					if streamResponse.Response.Usage.InputTokens != 0 {
-						usage.PromptTokens = streamResponse.Response.Usage.InputTokens
-					}
-					if streamResponse.Response.Usage.OutputTokens != 0 {
-						usage.CompletionTokens = streamResponse.Response.Usage.OutputTokens
-					}
-					if streamResponse.Response.Usage.TotalTokens != 0 {
-						usage.TotalTokens = streamResponse.Response.Usage.TotalTokens
-					}
-					if streamResponse.Response.Usage.InputTokensDetails != nil {
-						usage.PromptTokensDetails.CachedTokens = streamResponse.Response.Usage.InputTokensDetails.CachedTokens
-						usage.PromptTokensDetails.CacheWriteTokens = streamResponse.Response.Usage.InputTokensDetails.CacheWriteTokens
-					}
-				}
+				applyResponsesUsage(usage, streamResponse.Response.Usage)
 				if !imageCommitted {
 					if relaycommon.IsNonBillableResponsesStatus(streamResponse.Response.Status) {
 						imageCounter.Reset()
@@ -131,15 +199,40 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				imageCounter.Commit(info)
 				imageCommitted = true
 			}
-		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+			// Responses SSE does not reliably send a [DONE] sentinel. The protocol
+			// terminal event itself is authoritative and must stop the scanner.
+			sr.Done()
+		case "response.incomplete":
+			if streamResponse.Response != nil {
+				applyResponsesUsage(usage, streamResponse.Response.Usage)
+			}
 			if !imageCommitted {
 				imageCounter.Reset()
 				imageCounter.Commit(info)
 				imageCommitted = true
 			}
-		case "response.output_text.delta":
-			// 处理输出文本
-			responseTextBuilder.WriteString(streamResponse.Delta)
+			// Incomplete is a valid Responses terminal state (for example when
+			// max_output_tokens is reached), so terminate normally after forwarding.
+			sr.Done()
+		case "response.failed", "response.error", "response.cancelled", "response.canceled":
+			if streamResponse.Response != nil {
+				applyResponsesUsage(usage, streamResponse.Response.Usage)
+			}
+			if !imageCommitted {
+				imageCounter.Reset()
+				imageCounter.Commit(info)
+				imageCommitted = true
+			}
+			sr.Stop(responsesStreamTerminalError(streamResponse))
+		case "response.output_text.delta",
+			"response.function_call_arguments.delta",
+			"response.reasoning_summary_text.delta",
+			"response.reasoning_text.delta",
+			"response.refusal.delta":
+			// Accumulate all observable generated text for billing fallback, not
+			// only assistant output_text. Tool-only turns otherwise look like zero
+			// completion tokens when an upstream drops terminal usage.
+			fallbackOutputBuilder.WriteString(streamResponse.Delta)
 		case dto.ResponsesOutputTypeItemDone:
 			if streamResponse.Item != nil {
 				switch streamResponse.Item.Type {
@@ -158,21 +251,6 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 	})
 
-	if usage.CompletionTokens == 0 {
-		// 计算输出文本的 token 数量
-		tempStr := responseTextBuilder.String()
-		if len(tempStr) > 0 {
-			// 非正常结束，使用输出文本的 token 数量
-			completionTokens := service.CountTextToken(tempStr, info.UpstreamModelName)
-			usage.CompletionTokens = completionTokens
-		}
-	}
-
-	if usage.PromptTokens == 0 && usage.CompletionTokens != 0 {
-		usage.PromptTokens = info.GetEstimatePromptTokens()
-	}
-
-	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-
+	finalizeResponsesUsage(info, usage, fallbackOutputBuilder.String())
 	return usage, nil
 }
