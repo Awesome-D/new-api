@@ -42,30 +42,49 @@ func NewStreamStatus() *StreamStatus {
 	return &StreamStatus{}
 }
 
-// SetEndReason records why the stream ended. First write wins, with one
-// exception: a normal completion (the scanner saw [DONE] or hit a clean EOF)
-// is the ground truth about the stream and corrects an earlier client_gone.
+func isHandlerTerminalReason(reason StreamEndReason) bool {
+	return reason == StreamEndReasonDone ||
+		reason == StreamEndReasonHandlerStop ||
+		reason == StreamEndReasonPanic
+}
+
+// SetEndReason records why the stream ended. The first reason normally wins,
+// but later protocol-level terminal information is allowed to correct an
+// earlier transport-level observation.
 //
-// The main select can record client_gone in the small window between a client
-// closing the socket right after the final event and the scanner/handler
-// recording the terminal reason it already reached. Without this override that
-// race mislabels a finished stream. A genuine mid-stream disconnect makes the
-// forced body close surface as scanner_error, not a completion, so it keeps
-// client_gone.
+// Two races are intentionally handled here:
+//   1. Codex can close immediately after a final Responses event, so a later
+//      Done/EOF may correct an earlier client_gone.
+//   2. The scanner can enqueue the final SSE event and reach EOF before the
+//      handler goroutine processes that queued event. A later Done/HandlerStop
+//      is more specific than that transport EOF and must replace it.
+//
+// A genuine mid-stream client disconnect still stays client_gone because the
+// forced body close surfaces as scanner_error rather than a clean protocol
+// terminal event.
 func (s *StreamStatus) SetEndReason(reason StreamEndReason, err error) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if s.reasonSet {
-		if s.EndReason == StreamEndReasonClientGone &&
-			(reason == StreamEndReasonDone || reason == StreamEndReasonEOF) {
-			s.EndReason = reason
-			s.EndError = err
+		switch s.EndReason {
+		case StreamEndReasonClientGone:
+			if reason == StreamEndReasonDone || reason == StreamEndReasonEOF || reason == StreamEndReasonHandlerStop || reason == StreamEndReasonPanic {
+				s.EndReason = reason
+				s.EndError = err
+			}
+		case StreamEndReasonEOF:
+			if isHandlerTerminalReason(reason) {
+				s.EndReason = reason
+				s.EndError = err
+			}
 		}
 		return
 	}
+
 	s.reasonSet = true
 	s.EndReason = reason
 	s.EndError = err
