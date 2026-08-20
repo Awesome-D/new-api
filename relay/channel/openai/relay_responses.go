@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,7 +37,7 @@ func applyResponsesUsage(dst *dto.Usage, src *dto.Usage) {
 	}
 }
 
-func finalizeResponsesUsage(info *relaycommon.RelayInfo, usage *dto.Usage, fallbackOutput string) {
+func finalizeResponsesUsage(info *relaycommon.RelayInfo, usage *dto.Usage, fallbackOutput string, allowPromptEstimate bool) {
 	if usage == nil {
 		return
 	}
@@ -58,10 +59,12 @@ func finalizeResponsesUsage(info *relaycommon.RelayInfo, usage *dto.Usage, fallb
 		usage.CompletionTokens = usage.TotalTokens - usage.PromptTokens
 	}
 
-	// Final billing fallback: even a tool-only/reasoning-only Responses turn may
-	// have no visible output text. The locally estimated prompt is still known
-	// and must be charged rather than turning the whole request into $0.
-	if usage.PromptTokens == 0 && info != nil {
+	// Final billing fallback for a successfully terminated Responses request:
+	// even a tool-only/reasoning-only turn may have no visible output text. The
+	// locally estimated prompt is still known and must be charged rather than
+	// turning a successful request into $0. Do not synthesize prompt usage for a
+	// failed/cancelled terminal event that supplied no upstream usage.
+	if allowPromptEstimate && usage.PromptTokens == 0 && info != nil {
 		usage.PromptTokens = info.GetEstimatePromptTokens()
 	}
 
@@ -96,6 +99,24 @@ func responsesFallbackOutputText(outputs []dto.ResponsesOutput) string {
 	return b.String()
 }
 
+func responsesStatusAllowsPromptEstimate(status json.RawMessage) bool {
+	if len(status) == 0 {
+		return true
+	}
+	var value string
+	if err := common.Unmarshal(status, &value); err != nil {
+		// Unknown vendor-specific status should preserve the historical fallback
+		// behavior rather than silently making a successful response free.
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "failed", "cancelled", "canceled":
+		return false
+	default:
+		return true
+	}
+}
+
 func responsesStreamTerminalError(streamResponse dto.ResponsesStreamResponse) error {
 	if streamResponse.Response != nil {
 		if oaiErr := streamResponse.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Message != "" {
@@ -128,7 +149,12 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	// compute usage
 	usage := dto.Usage{}
 	applyResponsesUsage(&usage, responsesResponse.Usage)
-	finalizeResponsesUsage(info, &usage, responsesFallbackOutputText(responsesResponse.Output))
+	finalizeResponsesUsage(
+		info,
+		&usage,
+		responsesFallbackOutputText(responsesResponse.Output),
+		responsesStatusAllowsPromptEstimate(responsesResponse.Status),
+	)
 
 	// Count actual tool invocations from Output (not tool declarations).
 	for _, output := range responsesResponse.Output {
@@ -166,6 +192,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	var fallbackOutputBuilder strings.Builder
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
+	allowPromptEstimate := false
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
@@ -179,6 +206,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		sendResponsesStreamData(c, streamResponse, data)
 		switch streamResponse.Type {
 		case "response.completed", "response.done":
+			allowPromptEstimate = true
 			if streamResponse.Response != nil {
 				applyResponsesUsage(usage, streamResponse.Response.Usage)
 				if !imageCommitted {
@@ -203,6 +231,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			// terminal event itself is authoritative and must stop the scanner.
 			sr.Done()
 		case "response.incomplete":
+			allowPromptEstimate = true
 			if streamResponse.Response != nil {
 				applyResponsesUsage(usage, streamResponse.Response.Usage)
 			}
@@ -251,6 +280,6 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 	})
 
-	finalizeResponsesUsage(info, usage, fallbackOutputBuilder.String())
+	finalizeResponsesUsage(info, usage, fallbackOutputBuilder.String(), allowPromptEstimate)
 	return usage, nil
 }
