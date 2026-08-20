@@ -280,6 +280,14 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 	})
 
-	finalizeResponsesUsage(info, usage, fallbackOutputBuilder.String(), allowPromptEstimate)
+	fallbackOutput := fallbackOutputBuilder.String()
+	if fallbackOutput != "" {
+		// If observable model output was already delivered, the upstream has
+		// necessarily processed the request input. This remains billable even if
+		// the downstream disconnects before response.completed/usage arrives.
+		// Keep the no-output failed/cancelled path conservative at zero.
+		allowPromptEstimate = true
+	}
+	finalizeResponsesUsage(info, usage, fallbackOutput, allowPromptEstimate)
 	return usage, nil
 }
