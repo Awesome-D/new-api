@@ -30,8 +30,11 @@ jobs:
             echo "::error::.solfix-version is empty"
             exit 1
           fi
+          APP_VERSION="v${VERSION}-solfix"
+          printf '%s\n' "$APP_VERSION" > VERSION
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Building SolFix $VERSION"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building SolFix $VERSION as $APP_VERSION"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
